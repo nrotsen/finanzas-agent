@@ -1,0 +1,4 @@
+# Solo para correr los tests. Las Lambdas se empaquetan con src/requirements.txt,
+# que no incluye nada de esto.
+-r requirements.txt
+pytest>=8.0

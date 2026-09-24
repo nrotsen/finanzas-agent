@@ -1,0 +1,169 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: finanzas-agent — WhatsApp + Claude + Sheets/Dynamo
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 512
+
+Parameters:
+  GoogleSheetsId:
+    Type: String
+    Description: ID del Google Sheet de gastos
+  MetaPhoneNumberId:
+    Type: String
+    Default: ""
+    Description: Phone Number ID de Meta WhatsApp (opcional hasta que se destrabe el registro)
+  AnthropicSecretName:
+    Type: String
+    Default: finanzas-agent/anthropic-api-key
+  GoogleSheetsCredsSecretName:
+    Type: String
+    Default: finanzas-agent/google-sheets-creds
+  MetaVerifyTokenSecretName:
+    Type: String
+    Default: finanzas-agent/meta-verify-token
+  MetaAccessTokenSecretName:
+    Type: String
+    Default: finanzas-agent/meta-access-token
+    Description: Existe el secret? Si no, las Lambdas arrancan igual y loguean warning.
+  MetaAppSecretName:
+    Type: String
+    Default: finanzas-agent/meta-app-secret
+    Description: Existe el secret? Si no, las Lambdas arrancan igual y loguean warning.
+  AllowedSendersSecretName:
+    Type: String
+    Default: finanzas-agent/allowed-senders
+    Description: wa_ids habilitados, separados por coma. Sin este secret el webhook descarta todo (fail-closed).
+  AgentProfileSecretName:
+    Type: String
+    Default: finanzas-agent/agent-profile
+    Description: JSON con owner_name y categorías (opcional; sin él se usa un perfil genérico).
+
+Resources:
+
+  # DynamoDB para historial de conversación (TTL 24h)
+  ConversationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: finanzas-agent-conversation
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+
+  # S3 para subir resúmenes de tarjeta (PDFs) — fase 5
+  StatementsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub finanzas-agent-statements-${AWS::AccountId}
+      LifecycleConfiguration:
+        Rules:
+          - Id: cleanup-old
+            Status: Enabled
+            ExpirationInDays: 90
+
+  # Lambda webhook de WhatsApp (router)
+  WebhookFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: finanzas-agent-webhook
+      CodeUri: ../
+      Handler: src.handlers.whatsapp_webhook.lambda_handler
+      Environment:
+        Variables:
+          CONVERSATION_TABLE: !Ref ConversationTable
+          AGENT_FUNCTION_NAME: !Ref AgentRunnerFunction
+          ANTHROPIC_SECRET_NAME: !Ref AnthropicSecretName
+          GOOGLE_SHEETS_CREDS_SECRET_NAME: !Ref GoogleSheetsCredsSecretName
+          META_VERIFY_TOKEN_SECRET_NAME: !Ref MetaVerifyTokenSecretName
+          META_ACCESS_TOKEN_SECRET_NAME: !Ref MetaAccessTokenSecretName
+          META_APP_SECRET_SECRET_NAME: !Ref MetaAppSecretName
+          ALLOWED_SENDERS_SECRET_NAME: !Ref AllowedSendersSecretName
+          AGENT_PROFILE_SECRET_NAME: !Ref AgentProfileSecretName
+          GOOGLE_SHEETS_ID: !Ref GoogleSheetsId
+          META_PHONE_NUMBER_ID: !Ref MetaPhoneNumberId
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConversationTable
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AgentRunnerFunction
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:finanzas-agent/*
+      Events:
+        WebhookGet:
+          Type: Api
+          Properties:
+            Path: /webhook
+            Method: GET
+            RestApiId: !Ref WhatsAppApi
+        WebhookPost:
+          Type: Api
+          Properties:
+            Path: /webhook
+            Method: POST
+            RestApiId: !Ref WhatsAppApi
+
+  # Lambda que corre el agente (invocada async desde el webhook)
+  AgentRunnerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: finanzas-agent-runner
+      CodeUri: ../
+      Handler: src.handlers.agent_runner.lambda_handler
+      Timeout: 120
+      MemorySize: 1024
+      Environment:
+        Variables:
+          CONVERSATION_TABLE: !Ref ConversationTable
+          ANTHROPIC_SECRET_NAME: !Ref AnthropicSecretName
+          GOOGLE_SHEETS_CREDS_SECRET_NAME: !Ref GoogleSheetsCredsSecretName
+          META_VERIFY_TOKEN_SECRET_NAME: !Ref MetaVerifyTokenSecretName
+          META_ACCESS_TOKEN_SECRET_NAME: !Ref MetaAccessTokenSecretName
+          META_APP_SECRET_SECRET_NAME: !Ref MetaAppSecretName
+          ALLOWED_SENDERS_SECRET_NAME: !Ref AllowedSendersSecretName
+          AGENT_PROFILE_SECRET_NAME: !Ref AgentProfileSecretName
+          GOOGLE_SHEETS_ID: !Ref GoogleSheetsId
+          META_PHONE_NUMBER_ID: !Ref MetaPhoneNumberId
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConversationTable
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:finanzas-agent/*
+
+  # API Gateway
+  WhatsAppApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      EndpointConfiguration:
+        Type: REGIONAL
+
+Outputs:
+  WebhookUrl:
+    Description: URL a configurar en Meta como webhook
+    Value: !Sub https://${WhatsAppApi}.execute-api.${AWS::Region}.amazonaws.com/prod/webhook
+  WebhookFunctionName:
+    Value: !Ref WebhookFunction
+  AgentRunnerFunctionName:
+    Value: !Ref AgentRunnerFunction
+  ConversationTableName:
+    Value: !Ref ConversationTable
+  StatementsBucket:
+    Value: !Ref StatementsBucket

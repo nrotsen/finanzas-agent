@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+creds/
+.aws-sam/
+samconfig.toml
+.DS_Store
+.claude/settings.local.json
